@@ -1,0 +1,1492 @@
+---
+title: "Africa's Bilateral Debt Network: Financial Integration, Concentration and Economic Centrality (2014–2024)"
+author: "Network Analysis Project"
+date: 
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+    self_contained: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=FALSE, warning=FALSE, message=FALSE, fig.align="center", out.width="100%")
+required <- c("dplyr","tidyr","ggplot2","purrr","tibble","stringr","readr","igraph","knitr","scales","ggrepel")
+missing_pkg <- required[!vapply(required, requireNamespace, logical(1), quietly=TRUE)]
+if(length(missing_pkg)) stop("Install required packages: ",paste(missing_pkg,collapse=", "))
+invisible(lapply(required, library, character.only=TRUE))
+options(scipen=999)
+fmt <- function(x, d=2) ifelse(is.finite(x), format(round(x,d), nsmall=d, big.mark=","), "NA")
+fmtpct <- function(x) paste0(fmt(100*x,1),"%")
+```
+
+# Research question and data
+
+This study examines the evolution of Africa's bilateral public and publicly guaranteed (PPG) external debt network between 2014 and 2024. Creditors are connected to African debtors through directed links, weighted by outstanding bilateral debt in current US dollars. The analysis examines creditor exposure, financial connectivity, regional integration, concentration, community structure and economic correlates of centrality. Financial integration here refers only to bilateral PPG external-debt relationships, not the entire financial system. The empirical results are calculated directly from the supplied data each time this report is knitted.
+
+```{r input}
+ids_file <- "~/Downloads/P_Data_Extract_From_International_Debt_Statistics (5)/ea003755-8425-461c-9778-86a0bfdaca1f_Data.csv"
+file_path <- "~/Downloads/CLA-Database-Raw-Data-Public-2025-FIN.xlsx"
+
+if (!file.exists(path.expand(ids_file))) {
+  stop("World Bank IDS file not found at: ", ids_file)
+}
+overview <- read.csv(ids_file, check.names = FALSE)
+required_columns <- c("Country Name", "Country Code", "Counterpart-Area Name", "Series Code")
+if (!all(required_columns %in% names(overview))) {
+  stop("IDS data missing columns: ", paste(setdiff(required_columns, names(overview)), collapse=", "))
+}
+cat("World Bank IDS source:", basename(ids_file), "\n")
+# The CLA workbook contains Chinese lending commitments, not bilateral debt stocks.
+# Its location is recorded for reference; it is not merged with IDS debt stocks.
+```
+
+```{r country-setup}
+normalize_country <- function(x) {
+  x <- trimws(as.character(x))
+  x <- gsub("\u00A0", " ", x, fixed = TRUE)
+  x <- gsub("[[:space:]]+", " ", x)
+
+  dplyr::recode(
+    x,
+    "Egypt, Arab Rep." = "Egypt",
+    "Egypt, Arab Republic" = "Egypt",
+    "Cape Verde" = "Cabo Verde",
+    "Gambia, The" = "Gambia",
+    "The Gambia" = "Gambia",
+    "Congo, Dem. Rep." = "DR Congo",
+    "Congo, Democratic Republic of" = "DR Congo",
+    "Democratic Republic of Congo" = "DR Congo",
+    "Democratic Republic of the Congo" = "DR Congo",
+    "Congo, Rep." = "Republic of Congo",
+    "Cote d’Ivoire" = "Cote d'Ivoire",
+    "Côte d’Ivoire" = "Cote d'Ivoire",
+    "Côte d'Ivoire" = "Cote d'Ivoire",
+    "Ivory Coast" = "Cote d'Ivoire",
+    "Swaziland" = "Eswatini",
+    "Sao Tome & Principe" = "Sao Tome and Principe",
+    "São Tomé and Príncipe" = "Sao Tome and Principe",
+    "Somalia, Fed. Rep." = "Somalia",
+    "United Republic of Tanzania" = "Tanzania",
+    "Tanzania, United Republic of" = "Tanzania",
+    .default = x
+  )
+}
+
+african_countries <- c(
+  "Algeria", "Angola", "Benin", "Botswana",
+  "Burkina Faso", "Burundi", "Cabo Verde",
+  "Cameroon", "Central African Republic", "Chad",
+  "Comoros", "DR Congo", "Republic of Congo",
+  "Cote d'Ivoire", "Djibouti", "Egypt",
+  "Equatorial Guinea", "Eritrea", "Eswatini",
+  "Ethiopia", "Gabon", "Gambia", "Ghana",
+  "Guinea", "Guinea-Bissau", "Kenya", "Lesotho",
+  "Liberia", "Libya", "Madagascar", "Malawi",
+  "Mali", "Mauritania", "Mauritius", "Morocco",
+  "Mozambique", "Namibia", "Niger", "Nigeria",
+  "Rwanda", "Sao Tome and Principe", "Senegal",
+  "Seychelles", "Sierra Leone", "Somalia",
+  "South Africa", "South Sudan", "Sudan",
+  "Tanzania", "Togo", "Tunisia", "Uganda",
+  "Zambia", "Zimbabwe"
+)
+
+aggregate_creditors <- c(
+  "All bilateral creditors", "All creditors",
+  "Bilateral creditors", "Official creditors",
+  "Multilateral creditors", "Private creditors",
+  "Other bilateral creditors"
+)
+```
+
+```{r build-edges}
+years_analysis <- 2014:2024
+year_cols <- grep("^20[0-9]{2} \\[YR", names(overview), value=TRUE)
+if(!length(year_cols)) stop("No year columns found: expected labels such as '2014 [YR2014]'.")
+raw <- overview %>%
+  filter(`Series Code`=="DT.DOD.BLAT.CD", !is.na(`Country Name`), !is.na(`Counterpart-Area Name`)) %>%
+  select(all_of(c("Country Name","Counterpart-Area Name",year_cols))) %>%
+  pivot_longer(cols=all_of(year_cols),names_to="year_label",values_to="debt_raw") %>%
+  transmute(Year=as.integer(substr(year_label,1,4)),
+            from=normalize_country(`Counterpart-Area Name`),
+            to=normalize_country(`Country Name`),
+            weight=suppressWarnings(as.numeric(ifelse(as.character(debt_raw)=="..",NA,as.character(debt_raw))))) %>%
+  filter(Year %in% years_analysis, to %in% african_countries,
+         !from %in% aggregate_creditors, from!="Congo", from!=to, from!="",to!="") %>%
+  distinct()
+conflicts <- raw %>% filter(!is.na(weight)) %>% count(Year,from,to,name="n") %>% filter(n>1)
+if(nrow(conflicts)>0) {
+  different <- raw %>% filter(!is.na(weight)) %>% group_by(Year,from,to) %>%
+    summarise(n_values=n_distinct(weight),.groups="drop") %>% filter(n_values>1)
+  if(nrow(different)>0) stop("Conflicting debt amounts for the same creditor–debtor–year. Resolve in source data; first conflicts: ",paste(head(paste(different$Year,different$from,different$to),5),collapse="; "))
+}
+raw <- raw %>% group_by(Year,from,to) %>% summarise(weight=if(all(is.na(weight))) NA_real_ else first(weight[!is.na(weight)]),.groups="drop")
+coverage <- raw %>% group_by(Year,Country=to) %>% summarise(has_data=any(!is.na(weight)),.groups="drop")
+# Important: missing debt is not treated as zero.
+edges <- raw %>% filter(!is.na(weight),weight>0) %>% select(Year,from,to,weight)
+if(nrow(edges)==0) stop("No positive bilateral debt links found in the selected years.")
+coverage_summary <- tibble(Metric=c("Years","African debtors with observed values","Distinct creditors with positive exposure","Positive annual links","Conflicting duplicate keys"),
+  Value=c("2014–2024",n_distinct(coverage$Country[coverage$has_data]),n_distinct(edges$from),nrow(edges),0))
+knitr::kable(coverage_summary,caption="Dataset and network coverage")
+```
+# Global–Africa and intra-African networks
+
+The global network identifies external creditors and African debtors. The intra-African subnetwork isolates creditor–debtor relationships in which both countries are African.
+
+  
+
+```{r graph-structure}
+network_structure <- purrr::map_dfr(years_analysis,function(y) {
+  e <- edges %>% filter(Year==y)
+  e_af <- e %>% filter(from %in% african_countries)
+  tibble(Year=y,Links=nrow(e),Creditors=n_distinct(e$from),Debtors=n_distinct(e$to),
+         Intra_African_Links=nrow(e_af),Debt_USD_Billion=sum(e$weight)/1e9)
+})
+knitr::kable(network_structure,digits=2,caption="Annual debt-network structure")
+```
+
+
+```{r global-network-colored, fig.width=15, fig.height=11, echo=FALSE, warning=FALSE, message=FALSE}
+library(dplyr)
+library(igraph)
+
+# Average observed annual bilateral debt stock (2014-2024)
+e_plot <- edges %>%
+  filter(weight > 0, is.finite(weight)) %>%
+  group_by(from, to) %>%
+  summarise(
+    weight = mean(weight),
+    .groups = "drop"
+  )
+
+g <- graph_from_data_frame(
+  e_plot %>% select(from, to, weight),
+  directed = TRUE
+)
+
+# Financial importance of each node
+in_debt <- strength(g, mode = "in", weights = E(g)$weight)
+out_exposure <- strength(g, mode = "out", weights = E(g)$weight)
+
+is_african <- V(g)$name %in% african_countries
+
+# Assign low / medium / high categories within each group
+make_tiers <- function(x) {
+  result <- rep(1L, length(x))
+  positive <- is.finite(x) & x > 0
+
+  if (sum(positive) >= 3) {
+    q <- quantile(x[positive], c(1/3, 2/3), na.rm = TRUE)
+    result[positive] <- 1L +
+      as.integer(x[positive] > q[1]) +
+      as.integer(x[positive] > q[2])
+  } else if (any(positive)) {
+    result[positive] <- 3L
+  }
+
+  result
+}
+
+debt_tier <- make_tiers(in_debt[is_african])
+creditor_tier <- make_tiers(out_exposure[!is_african])
+
+# Color palette
+africa_palette <- c(
+  "#FBE5A6",  # Lower incoming debt
+  "#F39C12",  # Medium incoming debt
+  "#C65A00"   # Higher incoming debt
+)
+
+creditor_palette <- c(
+  "#B9DDF2",  # Lower exposure
+  "#4293C3",  # Medium exposure
+  "#084B8A"   # Higher exposure
+)
+
+node_colors <- character(vcount(g))
+node_colors[is_african] <- africa_palette[debt_tier]
+node_colors[!is_african] <- creditor_palette[creditor_tier]
+
+# Node size reflects financial importance
+importance <- ifelse(
+  is_african,
+  in_debt,
+  out_exposure
+)
+
+node_sizes <- 7 + 13 *
+  log1p(importance / 1e9) /
+  max(log1p(importance / 1e9), na.rm = TRUE)
+
+# Edge width reflects average debt stock
+edge_weights <- E(g)$weight
+
+edge_widths <- 0.25 + 2.5 *
+  sqrt(edge_weights / max(edge_weights))
+
+# Keep the force-directed layout of the first graph
+set.seed(42)
+g_undirected <- as.undirected(
+  g,
+  mode = "collapse",
+  edge.attr.comb = list(weight = "sum")
+)
+
+layout_net <- layout_with_fr(g_undirected)
+
+# Plot
+par(mar = c(2, 2, 4, 2), xpd = NA)
+
+plot(
+  g,
+  layout = layout_net,
+  vertex.color = node_colors,
+  vertex.frame.color = "#555555",
+  vertex.size = node_sizes,
+  vertex.label = V(g)$name,
+  vertex.label.cex = 0.45,
+  vertex.label.color = "#222222",
+  edge.color = adjustcolor("#94A3B8", alpha.f = 0.30),
+  edge.width = edge_widths,
+  edge.arrow.size = 0.07,
+  main = "Global-Africa Weighted Bilateral Debt Network (2014-2024)",
+  margin = 0.15
+)
+
+# Legends
+legend(
+  "topleft",
+  title = "African countries",
+  legend = c(
+    "Higher incoming debt",
+    "Medium incoming debt",
+    "Lower incoming debt"
+  ),
+  col = rev(africa_palette),
+  pch = 19,
+  pt.cex = 1.5,
+  bty = "n",
+  cex = 0.8
+)
+
+legend(
+  "topright",
+  title = "Non-African creditors",
+  legend = c(
+    "Higher credit exposure",
+    "Medium credit exposure",
+    "Lower credit exposure"
+  ),
+  col = rev(creditor_palette),
+  pch = 19,
+  pt.cex = 1.5,
+  bty = "n",
+  cex = 0.8
+)
+
+legend(
+  "bottomright",
+  title = "Directed links",
+  legend = c(
+    "Higher debt relationship",
+    "Medium debt relationship",
+    "Lower debt relationship"
+  ),
+  lwd = c(2.5, 1.3, 0.4),
+  col = "#64748B",
+  bty = "n",
+  cex = 0.8
+)
+```
+
+
+```{r intra-african-weighted-network, fig.width=16, fig.height=13, warning=FALSE, message=FALSE}
+library(dplyr)
+library(igraph)
+
+# Aggregate intra-African debt relationships
+intra_links <- edges %>%
+  filter(
+    Year >= 2014,
+    Year <= 2024,
+    from %in% african_countries,
+    to %in% african_countries,
+    from != to,
+    weight > 0
+  ) %>%
+  group_by(from, to) %>%
+  summarise(
+    weight = sum(weight),
+    .groups = "drop"
+  )
+
+g_intra <- graph_from_data_frame(
+  intra_links %>% select(from, to, weight),
+  directed = TRUE
+)
+
+# Calculate incoming debt and outgoing lending
+in_debt <- strength(
+  g_intra,
+  mode = "in",
+  weights = E(g_intra)$weight
+)
+
+out_credit <- strength(
+  g_intra,
+  mode = "out",
+  weights = E(g_intra)$weight
+)
+
+# Countries ordered by total financial involvement
+total_exposure <- in_debt + out_credit
+node_order <- order(total_exposure, decreasing = TRUE)
+
+# Circular layout with all countries separated
+n <- vcount(g_intra)
+
+angles <- seq(
+  0, 2 * pi,
+  length.out = n + 1
+)[1:n]
+
+coords <- matrix(0, nrow = n, ncol = 2)
+
+coords[node_order, 1] <- cos(angles)
+coords[node_order, 2] <- sin(angles)
+
+# Colour scale: lighter = less incoming debt
+palette_nodes <- colorRampPalette(
+  c("#FFE7A3", "#F4B544", "#E88900", "#A84A00")
+)(100)
+
+scale_values <- function(x) {
+  x <- log1p(x)
+
+  if (diff(range(x)) == 0) {
+    return(rep(50L, length(x)))
+  }
+
+  1L + round(
+    99 * (x - min(x)) / diff(range(x))
+  )
+}
+
+node_colors <- palette_nodes[scale_values(in_debt)]
+
+# Smaller nodes to avoid overlaps
+node_sizes <- 5 + 13 *
+  sqrt(in_debt / max(in_debt))
+
+# Link colours and thickness
+palette_edges <- colorRampPalette(
+  c("#C8C8C8", "#888888", "#454545", "#111111")
+)(100)
+
+edge_colors <- palette_edges[
+  scale_values(E(g_intra)$weight)
+]
+
+edge_widths <- 0.5 + 3 *
+  sqrt(E(g_intra)$weight / max(E(g_intra)$weight))
+
+# Labels outside the circle
+label_distance <- 1.5
+
+# Plot network
+layout(
+  matrix(c(1, 2), nrow = 1),
+  widths = c(4.5, 1)
+)
+
+par(mar = c(2, 2, 3, 2))
+
+plot(
+  g_intra,
+  layout = coords,
+  vertex.size = node_sizes,
+  vertex.color = node_colors,
+  vertex.frame.color = "#555555",
+  vertex.label = V(g_intra)$name,
+  vertex.label.cex = 0.68,
+  vertex.label.color = "#202020",
+  vertex.label.dist = label_distance,
+  edge.color = edge_colors,
+  edge.width = edge_widths,
+  edge.arrow.size = 0.25,
+  edge.curved = 0.18,
+  margin = 0.25,
+  main = "Intra-African Weighted Debt Network (2014–2024)"
+)
+
+# Legend panel
+par(mar = c(2, 1, 3, 1))
+plot.new()
+
+legend(
+  "topleft",
+  legend = c(
+    "Higher incoming debt",
+    "Medium incoming debt",
+    "Lower incoming debt"
+  ),
+  pch = 21,
+  pt.bg = c("#A84A00", "#E88900", "#FFE7A3"),
+  pt.cex = c(2.3, 1.8, 1.3),
+  col = "#555555",
+  bty = "n",
+  cex = 0.85,
+  title = "African countries"
+)
+
+legend(
+  "center",
+  legend = c(
+    "Higher debt relationship",
+    "Medium debt relationship",
+    "Lower debt relationship"
+  ),
+  lwd = c(4, 2.5, 1),
+  col = c("#111111", "#777777", "#C8C8C8"),
+  bty = "n",
+  cex = 0.85,
+  title = "Directed links"
+)
+
+mtext(
+  "Arrows indicate creditor to debtor",
+  side = 1,
+  line = 0,
+  cex = 0.8
+)
+
+layout(1)
+```
+
+
+
+
+
+
+
+###top 15 creditor
+
+```{r top-creditors, fig.width=11, fig.height=7}
+edges_2024 <- edges %>%
+  filter(Year == 2024)
+
+creditor_top <- edges_2024 %>%
+  group_by(from) %>%
+  summarise(
+    Exposure_USD_Bn = sum(weight) / 1e9,
+    .groups = "drop"
+  ) %>%
+  slice_max(Exposure_USD_Bn, n = 15, with_ties = FALSE)
+
+ggplot(
+  creditor_top,
+  aes(x = reorder(from, Exposure_USD_Bn),
+      y = Exposure_USD_Bn)
+) +
+  geom_col(fill = "#c17b28", width = 0.72) +
+  coord_flip() +
+  labs(
+    title = "Largest Bilateral Creditors to African Countries (2024)",
+    subtitle = "Outstanding bilateral debt stocks",
+    x = NULL,
+    y = "Debt Exposure (USD Billion)"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(panel.grid.major.y = element_blank())
+```
+
+ Top 15 African debtors
+
+
+```{r top-debtors, fig.width=11, fig.height=7}
+debtor_top <- edges_2024 %>%
+  group_by(to) %>%
+  summarise(
+    Debt_USD_Bn = sum(weight) / 1e9,
+    Number_Creditors = n_distinct(from),
+    .groups = "drop"
+  ) %>%
+  slice_max(Debt_USD_Bn, n = 15, with_ties = FALSE)
+
+ggplot(
+  debtor_top,
+  aes(x = reorder(to, Debt_USD_Bn),
+      y = Debt_USD_Bn)
+) +
+  geom_col(fill = "#258b7b", width = 0.72) +
+  coord_flip() +
+  labs(
+    title = "Largest African Bilateral-Debt Borrowers (2024)",
+    subtitle = "Total outstanding bilateral debt",
+    x = NULL,
+    y = "Outstanding Debt (USD Billion)"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(panel.grid.major.y = element_blank())
+```
+
+
+```{r verify-largest-debtors}
+library(dplyr)
+library(knitr)
+
+debt_ranking_2024 <- edges %>%
+  filter(Year == 2024, weight > 0) %>%
+  group_by(Country = to) %>%
+  summarise(
+    Total_Debt_USD_Bn = sum(weight) / 1e9,
+    Number_Creditors = n_distinct(from),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(Total_Debt_USD_Bn))
+
+kable(
+  head(debt_ranking_2024, 20),
+  digits = 2,
+  caption = "Top 20 African Countries by Bilateral Debt Stock (2024)"
+)
+
+# Egypt's exact position
+debt_ranking_2024 %>%
+  mutate(Rank = row_number()) %>%
+  filter(Country == "Egypt")
+```
+
+```{r}
+edges %>%
+  filter(Year == 2024, to == "Egypt") %>%
+  arrange(desc(weight)) %>%
+  mutate(Debt_USD_Bn = round(weight / 1e9, 3)) %>%
+  select(Creditor = from, Debt_USD_Bn)
+```
+
+
+Intra-African bilateral debt
+
+```{r intra-african-links, fig.width=11, fig.height=7}
+intra_2024 <- edges_2024 %>%
+  filter(
+    from %in% african_countries,
+    to %in% african_countries
+  )
+
+if (nrow(intra_2024) > 0) {
+
+  intra_top <- intra_2024 %>%
+    mutate(
+      Exposure_USD_Mn = weight / 1e6,
+      Relationship = paste(from, "→", to)
+    ) %>%
+    slice_max(weight, n = 15, with_ties = FALSE)
+
+  ggplot(
+    intra_top,
+    aes(
+      x = reorder(Relationship, Exposure_USD_Mn),
+      y = Exposure_USD_Mn
+    )
+  ) +
+    geom_col(fill = "#258b7b", width = 0.7) +
+    coord_flip() +
+    labs(
+      title = "Largest Intra-African Bilateral Debt Relationships (2024)",
+      subtitle = "African creditors lending to African borrowers",
+      x = NULL,
+      y = "Outstanding Debt (USD Million)"
+    ) +
+    theme_minimal(base_size = 13) +
+    theme(panel.grid.major.y = element_blank())
+
+} else {
+  plot.new()
+  title(main = "No Intra-African Bilateral Debt Links Observed")
+}
+```
+
+
+Centrality and financial exposure
+
+In-degree counts distinct creditor relationships for an African debtor; in-strength measures the outstanding debt stock across these relationships. Out-degree and out-strength describe the corresponding lending side. Both unweighted and debt-weighted eigenvector centrality are calculated on the undirected projection. This distinguishes structural connectivity from connectivity to nodes linked by large financial exposures. Node strength is measured in US dollars and is distinct from degree.
+
+```{r centrality}
+covered <- coverage %>% filter(has_data) %>% select(Year,Country)
+annual_nodes <- purrr::map_dfr(years_analysis,function(y){
+ e <- edges %>% filter(Year==y)
+ verts <- sort(unique(c(e$from,e$to,covered$Country[covered$Year==y])))
+ if(!length(verts)) return(tibble())
+ g <- graph_from_data_frame(e %>% select(from,to,weight),directed=TRUE,vertices=tibble(name=verts))
+ gu <- as.undirected(g,mode="collapse",edge.attr.comb=list(weight="sum"))
+ ev <- if(ecount(gu)>0) eigen_centrality(gu,directed=FALSE,weights=NA)$vector[V(g)$name] else rep(0,vcount(g))
+ ev_weighted <- if(ecount(gu)>0) eigen_centrality(gu,directed=FALSE,weights=E(gu)$weight/1e9)$vector[V(g)$name] else rep(0,vcount(g))
+ tibble(Year=y,Country=V(g)$name,IN=as.numeric(degree(g,mode="in")),OUT=as.numeric(degree(g,mode="out")),
+        IN_strength=as.numeric(strength(g,mode="in",weights=E(g)$weight)),
+        OUT_strength=as.numeric(strength(g,mode="out",weights=E(g)$weight)),
+        EIGEN=as.numeric(ev),EIGEN_weighted=as.numeric(ev_weighted)) %>% filter(Country %in% african_countries) %>%
+   inner_join(covered %>% filter(Year==y),by=c("Year","Country"))
+})
+centrality_avg <- annual_nodes %>% group_by(Country) %>% summarise(
+  Years=n(),IN=mean(IN),OUT=mean(OUT),DEG=mean(IN+OUT),
+  EIGEN=mean(EIGEN),EIGEN_weighted=mean(EIGEN_weighted),In_strength_USD_Bn=mean(IN_strength)/1e9,
+  Out_strength_USD_Bn=mean(OUT_strength)/1e9,.groups="drop")
+knitr::kable(centrality_avg %>% arrange(desc(In_strength_USD_Bn)) %>% head(20),digits=3,
+ caption="Table 3. African countries: degree, node strength (USD billion) and weighted/unweighted eigenvector centrality")
+```
+
+```{r creditors}
+creditor_rank <- edges %>% group_by(Year,from) %>% summarise(
+  Debtor_connections=n_distinct(to),Exposure_USD_Bn=sum(weight)/1e9,.groups="drop")
+creditor_total <- creditor_rank %>% group_by(from) %>% summarise(
+  Mean_connections=mean(Debtor_connections),Mean_exposure_USD_Bn=mean(Exposure_USD_Bn),.groups="drop") %>% arrange(desc(Mean_exposure_USD_Bn))
+knitr::kable(head(creditor_total,15),digits=2,caption="Main creditors ranked by mean annual outstanding bilateral exposure")
+```
+
+Evolution of debt and the COVID period
+
+The following plots compare debt stocks and network connectivity before COVID (2014–2019), during COVID (2020–2021), and after COVID (2022–2024).
+
+```{r evolution,fig.width=12,fig.height=6}
+ggplot(network_structure,aes(Year,Debt_USD_Billion))+
+  annotate("rect",xmin=2019.5,xmax=2021.5,ymin=-Inf,ymax=Inf,fill="#f59e0b",alpha=.12)+
+  geom_line(color="#2563eb",linewidth=1.1)+geom_point(color="#2563eb",size=2.5)+
+  scale_x_continuous(breaks=years_analysis)+
+  labs(title="Outstanding bilateral debt to African debtors",subtitle="COVID years shaded",x=NULL,y="USD billions")+theme_minimal(base_size=12)
+```
+
+```{r covid-comparison}
+period_stats <- network_structure %>% mutate(Period=case_when(Year<=2019~"Pre-COVID (2014–2019)",Year<=2021~"COVID (2020–2021)",TRUE~"Post-COVID (2022–2024)")) %>%
+ group_by(Period) %>% summarise(Mean_debt_USD_Bn=mean(Debt_USD_Billion),Mean_links=mean(Links),Mean_creditors=mean(Creditors),.groups="drop")
+knitr::kable(period_stats,digits=2,caption="Period averages for the observed bilateral debt network")
+change_19_24 <- network_structure$Debt_USD_Billion[network_structure$Year==2024]/network_structure$Debt_USD_Billion[network_structure$Year==2019]-1
+cat("The observed bilateral debt stock changed by ",fmtpct(change_19_24)," between 2019 and 2024. This is a stock comparison and does not measure new lending.
+",sep="")
+```
+
+```{r debtor-change,fig.width=11,fig.height=8}
+change_tbl <- annual_nodes %>% filter(Year %in% c(2019,2024)) %>% select(Year,Country,IN_strength) %>%
+ pivot_wider(names_from=Year,values_from=IN_strength,names_prefix="y") %>%
+ filter(!is.na(y2019),!is.na(y2024),y2019>0) %>%
+ mutate(Change_pct=100*(y2024/y2019-1))
+if(nrow(change_tbl)) {
+ top_change <- change_tbl %>% arrange(desc(abs(Change_pct))) %>% head(18)
+ print(ggplot(top_change,aes(x=reorder(Country,Change_pct),y=Change_pct,fill=Change_pct>0))+
+  geom_col(show.legend=FALSE)+coord_flip()+scale_fill_manual(values=c("#c2410c","#0f766e"))+
+  labs(title="Largest proportional changes in bilateral debt stock, 2019–2024",x=NULL,y="Change (%)")+theme_minimal())
+}
+```
+
+Creditor concentration and dependence
+
+Creditor concentration is measured with the Herfindahl–Hirschman Index (HHI), the sum of squared bilateral creditor shares. Values closer to one indicate that debt is concentrated among fewer creditor
+
+```{r hhi}
+portfolio <- edges %>% group_by(Year,to) %>% mutate(Total_debt=sum(weight),Share=weight/Total_debt) %>% ungroup()
+concentration <- portfolio %>% group_by(Year,Country=to) %>% summarise(
+  HHI=sum(Share^2),Largest_creditor_share=max(Share),Number_creditors=n(),
+  Top_creditor=from[which.max(Share)],Debt_USD_Bn=first(Total_debt)/1e9,.groups="drop")
+concentration_summary <- concentration %>% group_by(Year) %>% summarise(
+  Mean_HHI=mean(HHI),Median_HHI=median(HHI),Mean_largest_share=mean(Largest_creditor_share),
+  Countries=n(),.groups="drop")
+knitr::kable(concentration_summary,digits=3,caption="Annual creditor concentration among African debtors with positive bilateral debt")
+```
+
+```{r hhi-plot,fig.width=11,fig.height=6}
+ggplot(concentration_summary,aes(Year,Mean_HHI))+
+ geom_line(color="#0f766e",linewidth=1.1)+geom_point(color="#0f766e",size=2.5)+
+ scale_x_continuous(breaks=years_analysis)+coord_cartesian(ylim=c(0,1))+
+ labs(title="Mean creditor concentration across African debtor countries",x=NULL,y="Mean HHI (0–1)")+theme_minimal(base_size=12)
+```
+
+```{r hhi-countries}
+knitr::kable(concentration %>% filter(Year==2024) %>% arrange(desc(HHI)) %>%
+ select(Country,Number_creditors,HHI,Largest_creditor_share,Top_creditor,Debt_USD_Bn) %>% head(20),
+ digits=3,caption="Most concentrated African bilateral creditor portfolios in 2024")
+```
+
+# Creditor groups and the role of China
+
+We compare China with other observed bilateral creditors. These are outstanding stocks, not annual Chinese loan commitments. Creditor classifications are descriptive and should not be interpreted as formal Paris Club membership.
+
+```{r creditor-groups}
+western <- c("France","Germany","Japan","United States","Italy","United Kingdom","Spain","Belgium","Canada","Netherlands","Portugal","Switzerland")
+creditor_group <- function(x) case_when(
+ x %in% c("China","China, People's Republic of") ~ "China",
+ x %in% western ~ "Selected Western/Japanese creditors",
+ grepl("Kuwait|Saudi|Arab|Abu Dhabi|Qatar|Emirates",x,ignore.case=TRUE) ~ "Selected Gulf/Arab creditors",
+ x %in% african_countries ~ "African creditors",
+ TRUE ~ "Other bilateral creditors")
+creditor_shares <- edges %>% mutate(Group=creditor_group(from)) %>%
+ group_by(Year,Group) %>% summarise(Debt_USD_Bn=sum(weight)/1e9,.groups="drop") %>%
+ group_by(Year) %>% mutate(Share=Debt_USD_Bn/sum(Debt_USD_Bn)) %>% ungroup()
+knitr::kable(creditor_shares %>% filter(Year %in% c(2014,2019,2024)) %>% arrange(Year,desc(Share)),digits=3,
+ caption="Bilateral debt stock by creditor group in benchmark years")
+```
+
+```{r group-plot,fig.width=12,fig.height=6}
+ggplot(creditor_shares,aes(Year,Share,fill=Group))+geom_area(alpha=.85)+
+ scale_y_continuous(labels=scales::percent_format())+scale_x_continuous(breaks=years_analysis)+
+ labs(title="Composition of Africa's observed bilateral debt by creditor group",x=NULL,y="Share of observed bilateral debt")+
+ theme_minimal(base_size=12)
+```
+
+```{r message=FALSE, warning=FALSE}
+library(readxl)
+library(tidyverse)
+library(scales)
+
+file_path <- "~/Downloads/CLA-Database-Raw-Data-Public-2025-FIN.xlsx"
+
+cla_raw <- read_excel(file_path)
+
+year_col   <- names(cla_raw)[grep("year", names(cla_raw), ignore.case = TRUE)][1]
+amount_col <- names(cla_raw)[grep("amount|usd|value", names(cla_raw), ignore.case = TRUE)][1]
+
+cla_clean <- cla_raw %>%
+  rename(
+    Year_Var   = all_of(year_col),
+    Amount_Var = all_of(amount_col)
+  ) %>%
+  mutate(
+    Year_Var   = as.numeric(Year_Var),
+    Amount_Var = as.numeric(Amount_Var)
+  ) %>%
+  filter(Year_Var >= 2014 & Year_Var <= 2024) %>%
+  group_by(Year_Var) %>%
+  summarise(
+    # Explicitly convert USD Millions to USD Billions
+    total_loans_billion = sum(Amount_Var, na.rm = TRUE) / 1000,
+    .groups = "drop"
+  )
+
+# Plotting
+ggplot(cla_clean, aes(x = Year_Var, y = total_loans_billion)) +
+  geom_area(fill = "#0072B2", alpha = 0.15) +
+  geom_line(color = "#0072B2", size = 1.2) +
+  geom_point(color = "#0072B2", size = 3) +
+  geom_text(
+    aes(label = sprintf("$%.1f B", total_loans_billion)),
+    vjust = -1.2,
+    fontface = "bold",
+    size = 3.5,
+    color = "grey20"
+  ) +
+  scale_x_continuous(breaks = 2014:2024) +
+  scale_y_continuous(
+    labels = dollar_format(suffix = " B", prefix = "$"),
+    limits = c(0, max(cla_clean$total_loans_billion) * 1.25)
+  ) +
+  theme_minimal(base_size = 12) +
+  labs(
+    title = "Chinese Bilateral Sovereign Loan Commitments to Africa (2014–2024)",
+    subtitle = "Annual financial commitments in USD Billions (Boston University CLA Database)",
+    x = "Year",
+    y = "Commitments (USD Billions)",
+    caption = "Source: Boston University Global Development Policy Center — CLA Database"
+  )
+```
+ Regional and global financial integration
+
+Financial integration is evaluated through the geography and diversification of bilateral debt relationships. The regional share measures outstanding debt owed to African creditors, while the external share measures debt owed to creditors outside Africa. 
+
+```{r regional-integration}
+integration_annual <- edges %>%
+ mutate(Creditor_origin=if_else(from %in% african_countries,"African creditors","Non-African creditors")) %>%
+ group_by(Year,Creditor_origin) %>%
+ summarise(Debt_USD_Bn=sum(weight)/1e9,Links=n(),Creditors=n_distinct(from),.groups="drop") %>%
+ group_by(Year) %>% mutate(Share=Debt_USD_Bn/sum(Debt_USD_Bn)) %>% ungroup()
+knitr::kable(integration_annual %>% filter(Year %in% c(2014,2019,2024)),digits=3,
+ caption="Regional and external shares of bilateral PPG debt in benchmark years")
+```
+
+```{r regional-integration-trend,fig.width=11,fig.height=6}
+ggplot(integration_annual,aes(Year,Share,color=Creditor_origin))+
+ geom_line(linewidth=1.1)+geom_point(size=2)+
+ scale_x_continuous(breaks=years_analysis)+
+ scale_y_continuous(labels=scales::percent_format(accuracy=1),limits=c(0,1))+
+ labs(title="Regional versus external bilateral-debt integration",
+ subtitle="Share of outstanding bilateral PPG debt, not new lending flows",x=NULL,y="Share of observed debt",color="Creditor location")+
+ theme_minimal(base_size=12)
+```
+
+A country-level comparison identifies which African debtors have regional creditor relationships and whether the overall trend is shared across countries.
+
+```{r country-integration}
+integration_debtor <- edges %>% mutate(African_creditor=from %in% african_countries) %>%
+ group_by(Year,Country=to) %>%
+ summarise(Total_debt_USD=sum(weight),African_debt_USD=sum(weight[African_creditor]),
+ African_creditor_count=n_distinct(from[African_creditor]),
+ External_creditor_count=n_distinct(from[!African_creditor]),.groups="drop") %>%
+ mutate(Regional_share=African_debt_USD/Total_debt_USD,
+        External_share=1-Regional_share)
+integration_country_year <- integration_debtor %>% group_by(Year) %>%
+ summarise(Mean_regional_share=mean(Regional_share),
+ Median_regional_share=median(Regional_share),
+ Debtors_with_regional_creditor=sum(African_creditor_count>0),
+ Observed_debtors=n(),.groups="drop")
+knitr::kable(integration_country_year,digits=3,
+ caption="Debtor-level regional integration: country averages and participation")
+knitr::kable(integration_debtor %>% filter(Year==2024) %>%
+ arrange(desc(Regional_share)) %>% head(15) %>%
+ transmute(Country,Regional_share,African_creditor_count,External_creditor_count,
+           Total_debt_USD_Bn=Total_debt_USD/1e9),digits=3,
+ caption="African debtor countries with the highest regional creditor share, 2024")
+```
+
+Financial connectivity and creditor diversification
+
+SonA larger number of creditor links does not necessarily mean a diversified portfolio. The HHI is compared with in-degree and regional exposure to distinguish network integration from concentration.
+
+```{r integration-concentration}
+integration_panel <- concentration %>%
+ left_join(integration_debtor %>% select(Year,Country,Regional_share),by=c("Year","Country"))
+safe_cor <- function(x,y) {
+ ok <- is.finite(x) & is.finite(y)
+ if(sum(ok)<3 || sd(x[ok])==0 || sd(y[ok])==0) return(NA_real_)
+ cor(x[ok],y[ok])
+}
+integration_correlations <- integration_panel %>% group_by(Year) %>%
+ summarise(Correlation_degree_HHI=safe_cor(Number_creditors,HHI),
+ Correlation_regional_HHI=safe_cor(Regional_share,HHI),
+ N=n(),.groups="drop")
+knitr::kable(integration_correlations,digits=3,
+ caption="Cross-country correlations: connectivity, regional integration and creditor concentration")
+```
+
+```{r integration-scatter,fig.width=10,fig.height=6}
+ggplot(integration_panel %>% filter(Year %in% c(2014,2024)),
+ aes(Number_creditors,HHI,color=factor(Year)))+
+ geom_point(alpha=.7,size=2)+
+ geom_smooth(method="lm",se=FALSE,linewidth=.8)+
+ labs(title="Creditor connectivity versus concentration",x="Number of bilateral creditors",y="HHI",color="Year")+
+ theme_minimal(base_size=12)
+```
+
+Communities and creditor-profile clusters
+
+Louvain communities are calculated on a weighted undirected projection of the debt network, while the original debt links remain directed. Separately, Ward's hierarchical clustering groups African debtors by their creditor shares. Four clusters are retained to make the 2014, 2019 and 2024 profiles comparable in number, cluster numbers do not necessarily represent the same composition across years.
+
+```{r communities}
+community_year <- function(y,intra=FALSE) {
+ e <- edges %>% filter(Year==y)
+ if(intra) e <- e %>% filter(from %in% african_countries,to %in% african_countries)
+ if(nrow(e)==0) return(tibble(Year=integer(),Country=character(),Community=integer(),Modularity=numeric(),Network=character()))
+ g <- graph_from_data_frame(e %>% select(from,to,weight),directed=TRUE)
+ gu <- as.undirected(g,mode="collapse",edge.attr.comb=list(weight="sum"))
+ if(ecount(gu)==0) return(tibble(Year=integer(),Country=character(),Community=integer(),Modularity=numeric(),Network=character()))
+ set.seed(42)
+ cm <- cluster_louvain(gu,weights=E(gu)$weight/1e9)
+ mem <- membership(cm)
+ tibble(Year=y,Country=names(mem),Community=as.integer(mem),
+        Modularity=as.numeric(modularity(cm)),
+        Network=if(intra) "Intra-African" else "Global–Africa")
+}
+community_global_years <- purrr::map_dfr(years_analysis,community_year,intra=FALSE)
+community_intra_years <- purrr::map_dfr(years_analysis,community_year,intra=TRUE)
+comm_global <- community_global_years %>% filter(Year==2024)
+comm_africa <- community_intra_years %>% filter(Year==2024)
+knitr::kable(comm_global %>% select(Country,Community) %>% arrange(Community,Country),
+ caption="Louvain communities in the global–Africa network, 2024")
+if(nrow(comm_africa)) knitr::kable(comm_africa %>% select(Country,Community) %>% arrange(Community,Country),
+ caption="Louvain communities in the intra-African network, 2024")
+```
+
+The modularity score $Q$ evaluates whether within-community connections are stronger than expected under the modularity null model. Annual Louvain partitions are compared separately for the global and intra-African networks. An increase in $Q$ indicates stronger community structure under this method, not necessarily political polarization or causal fragmentation.
+
+```{r modularity-trend,fig.width=11,fig.height=6}
+modularity_years <- bind_rows(community_global_years,community_intra_years) %>%
+ distinct(Year,Network,Modularity)
+knitr::kable(modularity_years %>% arrange(Network,Year),digits=3,
+ caption="Annual weighted Louvain modularity for the two network definitions")
+if(nrow(modularity_years)) {
+ print(ggplot(modularity_years,aes(Year,Modularity,color=Network))+
+ geom_line(linewidth=1)+geom_point(size=2)+
+ scale_x_continuous(breaks=years_analysis)+
+ labs(title="Evolution of Louvain modularity",subtitle="Modularity of weighted undirected network projections",x=NULL,y="Modularity Q")+
+ theme_minimal(base_size=12))
+}
+```
+
+```{r clustering}
+cluster_one_year <- function(y,k=4) {
+ e <- edges %>% filter(Year==y,!from %in% african_countries)
+ if(!nrow(e)) return(tibble())
+ wide <- e %>% group_by(to,from) %>% summarise(weight=sum(weight),.groups="drop") %>%
+ pivot_wider(names_from=from,values_from=weight,values_fill=0)
+ mat <- as.matrix(wide %>% select(-to))
+ shares <- mat/rowSums(mat)
+ rownames(shares) <- wide$to
+ if(nrow(shares)<k) return(tibble())
+ cl <- cutree(hclust(dist(shares),method="ward.D2"),k=k)
+ # PCA is stable, deterministic and does not create misleading t-SNE cross-year distances.
+ pc <- prcomp(shares,center=TRUE,scale.=FALSE)$x
+ tibble(Year=y,Country=rownames(shares),Cluster=paste0("Cluster ",as.integer(cl)),
+        Dim1=pc[,1],Dim2=if(ncol(pc)>=2) pc[,2] else 0)
+}
+clusters <- purrr::map_dfr(c(2014,2019,2024),cluster_one_year)
+if(nrow(clusters)) {
+  knitr::kable(clusters %>% select(Year,Country,Cluster) %>% arrange(Country,Year),
+    caption="Debtor cluster memberships based on bilateral creditor shares")
+}
+```
+
+```{r cluster-plot,fig.width=13,fig.height=8}
+if(nrow(clusters)) {
+ print(ggplot(clusters,aes(Dim1,Dim2,color=Cluster,label=Country))+
+ geom_point(size=2.2)+ggrepel::geom_text_repel(size=2.4,max.overlaps=15)+
+ facet_wrap(~Year,scales="free",nrow=1)+
+ labs(title="Ward's four-cluster partition of bilateral creditor profiles",subtitle="PCA coordinates are within-year descriptive projections; distances are not comparable across years",x="Principal component 1",y="Principal component 2")+
+ theme_minimal(base_size=11))
+}
+```
+
+```{r cluster-interpretation}
+if(nrow(clusters)) {
+ cluster_profiles <- clusters %>% left_join(portfolio,by=c("Year","Country"="to")) %>%
+ group_by(Year,Cluster,from) %>% summarise(Mean_creditor_share=mean(Share,na.rm=TRUE),.groups="drop") %>%
+ group_by(Year,Cluster) %>% slice_max(Mean_creditor_share,n=3,with_ties=FALSE) %>% ungroup()
+ knitr::kable(cluster_profiles,digits=3,caption="Largest mean creditor shares in each cluster (among cluster countries with the creditor present)")
+}
+```
+
+# Changes in creditor-profile clusters
+
+The 2014, 2019 and 2024 creditor-share clusters are compared through transition matrices and an alluvial-style flow chart. Since hierarchical cluster numbers are arbitrary, later labels are matched to the preceding benchmark year by maximizing overlap among countries observed in both years. These matched labels describe **portfolio similarity**, not permanent economic groups such as a formal Paris Club or China bloc.
+
+```{r cluster-transitions}
+if(all(c(2014,2019,2024) %in% clusters$Year)) {
+ match_cluster_labels <- function(reference,target,k=4) {
+   overlap <- inner_join(reference %>% select(Country,Previous=Cluster),
+                         target %>% select(Country,Current=Cluster),by="Country")
+   labels <- paste0("Cluster ",seq_len(k))
+   if(nrow(overlap)==0) return(target)
+   perms <- expand.grid(rep(list(seq_len(k)),k),KEEP.OUT.ATTRS=FALSE)
+   perms <- as.matrix(perms[apply(perms,1,function(z) length(unique(z))==k),,drop=FALSE])
+   scores <- apply(perms,1,function(z) {
+     sum(vapply(seq_len(k),function(j)
+       sum(overlap$Previous==labels[z[j]] & overlap$Current==labels[j]),numeric(1)))
+   })
+   best <- perms[which.max(scores),]
+   mapping <- setNames(labels[best],labels)
+   target %>% mutate(Cluster=unname(mapping[Cluster]))
+ }
+ cluster14 <- clusters %>% filter(Year==2014)
+ cluster19 <- match_cluster_labels(cluster14,clusters %>% filter(Year==2019))
+ cluster24 <- match_cluster_labels(cluster19,clusters %>% filter(Year==2024))
+ clusters_aligned <- bind_rows(cluster14,cluster19,cluster24)
+ transitions_14_19 <- inner_join(cluster14 %>% select(Country,From=Cluster),
+                               cluster19 %>% select(Country,To=Cluster),by="Country")
+ transitions_19_24 <- inner_join(cluster19 %>% select(Country,From=Cluster),
+                               cluster24 %>% select(Country,To=Cluster),by="Country")
+ transition_matrix <- function(d,title) {
+   tab <- as.data.frame.matrix(table(factor(d$From,levels=paste0("Cluster ",1:4)),
+                                      factor(d$To,levels=paste0("Cluster ",1:4))))
+   print(knitr::kable(tibble::rownames_to_column(tab,"From"),caption=title))
+ }
+ transition_matrix(transitions_14_19,"Creditor-profile cluster transitions, 2014 to 2019")
+ transition_matrix(transitions_19_24,"Creditor-profile cluster transitions, 2019 to 2024")
+ changed <- bind_rows(transitions_14_19 %>% mutate(Period="2014–2019"),
+                      transitions_19_24 %>% mutate(Period="2019–2024")) %>%
+ filter(From!=To) %>% arrange(Period,Country)
+ print(knitr::kable(changed,caption="Countries that changed aligned creditor-profile clusters"))
+} else {
+ clusters_aligned <- tibble(Year=integer(),Country=character(),Cluster=character())
+ cat("Cluster transition analysis is unavailable because no benchmark-year clusters were estimated.\n")
+}
+```
+
+```{r cluster-flow,fig.width=12,fig.height=7}
+if(nrow(clusters_aligned)) {
+ flow <- clusters_aligned %>% select(Year,Country,Cluster) %>%
+ pivot_wider(names_from=Year,values_from=Cluster,names_prefix="y") %>%
+ filter(!is.na(y2014),!is.na(y2019),!is.na(y2024)) %>%
+ count(y2014,y2019,y2024,name="Countries")
+ if(nrow(flow)) {
+   if(requireNamespace("ggalluvial",quietly=TRUE)) {
+     print(ggplot(flow,aes(axis1=y2014,axis2=y2019,axis3=y2024,y=Countries))+
+       ggalluvial::geom_alluvium(aes(fill=y2014),alpha=.75)+
+       ggalluvial::geom_stratum(width=.22,fill="grey90",color="grey40")+
+       ggplot2::geom_text(stat="stratum",aes(label=after_stat(stratum)),size=3)+
+       scale_x_discrete(limits=c("2014","2019","2024"),expand=c(.1,.1))+
+       labs(title="Transitions between creditor-profile clusters",x="Benchmark year",y="Countries",fill="2014 cluster")+
+       theme_minimal(base_size=12))
+   } else {
+     cat("Install the optional 'ggalluvial' package to display the flow chart. The transition matrices above remain available.\n")
+   }
+ }
+}
+```
+
+# Core–periphery and k-core structure
+
+The k-core decomposition identifies nodes that belong to increasingly interconnected subsets of the network. It is calculated on the undirected projection of observed creditor–debtor links. High coreness is evidence of embedded connectivity, not a formal statistical test of a core–periphery model; in a predominantly creditor–debtor network, the absence of triangles or reciprocal lending can limit the informative range of k-core scores.
+
+```{r core-periphery}
+core_results <- purrr::map_dfr(c(2014,2019,2024),function(y) {
+ e <- edges %>% filter(Year==y)
+ if(nrow(e)==0) return(tibble())
+ g <- graph_from_data_frame(e %>% select(from,to,weight),directed=TRUE)
+ gu <- as.undirected(g,mode="collapse",edge.attr.comb=list(weight="sum"))
+ tibble(Year=y,Country=V(gu)$name,Coreness=as.numeric(coreness(gu)),
+        Degree=as.numeric(degree(gu)),
+        Is_African=V(gu)$name %in% african_countries)
+})
+knitr::kable(core_results %>% group_by(Year) %>%
+ slice_max(Coreness,n=15,with_ties=FALSE) %>% ungroup(),digits=0,
+ caption="Highest k-core membership in benchmark-year debt networks")
+core_summary <- core_results %>% group_by(Year) %>%
+ summarise(Max_coreness=max(Coreness),Mean_coreness=mean(Coreness),
+ Nodes=n(),.groups="drop")
+knitr::kable(core_summary,digits=2,caption="Annual k-core summary in benchmark years")
+```
+
+So what makes a country more central?
+
+Economic size and the size of outstanding bilateral borrowing may be associated with the number of creditor relationships. We estimate a country–year panel regression with year effects. The dependent variable is the number of observed bilateral creditors; the main predictor is the logarithm of observed bilateral debt stock. This is just a descriptive association, becuae   borrowing more can mechanically coincide with having more creditors, and omitted GDP, creditworthiness and institutions may matter.
+
+```{r regression}
+reg_data <- annual_nodes %>% filter(IN_strength>0) %>%
+ mutate(log_debt=log(IN_strength),log_degree=log1p(IN),year_factor=factor(Year))
+if(nrow(reg_data)<20 || n_distinct(reg_data$Country)<5) {
+ cat("Insufficient country-year observations to estimate the regression.\n")
+ model <- NULL
+} else {
+ model <- lm(log_degree ~ log_debt + year_factor, data=reg_data)
+ reg_tab <- as.data.frame(summary(model)$coefficients) %>%
+  tibble::rownames_to_column("Term")
+ names(reg_tab) <- c("Term","Estimate","Std_error","t_value","p_value")
+ knitr::kable(reg_tab,digits=4,caption="OLS: log(1 + number of creditors) and bilateral debt stock, with year fixed effects")
+}
+```
+
+```{r regression-interpretation, results='asis'}
+if(!is.null(model)) {
+ co <- summary(model)$coefficients
+ b <- co["log_debt","Estimate"]; p <- co["log_debt","Pr(>|t|)"]
+ cat("The estimated coefficient on log outstanding debt is **",fmt(b,3),"** (p = ",fmt(p,4),"). ",sep="")
+ cat("Within the pooled country–year sample and conditional on year effects, a 1% higher observed bilateral debt stock is associated with approximately ",fmt(b,3),"% higher (1 + number of creditors). ",sep="")
+ if(p<.05) cat("The association is statistically distinguishable from zero at the 5% level. ")
+ else cat("The association is not statistically distinguishable from zero at the 5% level. ")
+ cat("The model R-squared is ",fmt(summary(model)$r.squared,3),". These results do not identify a causal effect.\n",sep="")
+}
+```
+To examine whether economic size and other available macroeconomic variables are associated with centrality, an extended specification uses World Bank WDI data. Institutional quality is not estimated because governance data are not included. When a `country_gdp_panel.csv` file containing `Country`, `Year`, `GDP_USD` and optional `GDP_per_capita_USD`, `Trade_open_percent_GDP`, and `FDI_net_inflows_percent_GDP` is available, the report estimates an extended model. GDP is also used to calculate bilateral debt-to-GDP ratios.
+
+```{r world-bank-gdp-automatic, message=FALSE, warning=FALSE}
+# Run this chunk AFTER 'annual_nodes', 'edges', 'african_countries',
+# and 'normalize_country' have been created in the existing R Markdown.
+# Requires internet access to the World Bank API during the first run.
+
+if (!requireNamespace("WDI", quietly = TRUE)) stop("Install the WDI package first: install.packages(\"WDI\")")
+library(WDI)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+
+# Match the country names used in this project's World Bank IDS dataset.
+# Start with the project's existing normalize_country() function.
+normalize_wdi_country <- function(x) {
+  x <- normalize_country(x)
+  dplyr::recode(x,
+    "Congo, Dem. Rep." = "DR Congo",
+    "Congo, Rep." = "Republic of Congo",
+    "Congo, Republic of" = "Republic of Congo",
+    "Democratic Republic of the Congo" = "DR Congo",
+    "Congo (Democratic Republic of the)" = "DR Congo",
+    "Congo (Republic of the)" = "Republic of Congo",
+    "Egypt, Arab Rep." = "Egypt",
+    "Gambia, The" = "Gambia",
+    "Côte d'Ivoire" = "Cote d'Ivoire",
+    "Côte d’Ivoire" = "Cote d'Ivoire",
+    "São Tomé and Príncipe" = "Sao Tome and Principe",
+    "Sao Tome and Principe" = "Sao Tome and Principe",
+    "Eswatini (Kingdom of)" = "Eswatini",
+    "Tanzania, United Republic of" = "Tanzania",
+    "Slovak Republic" = "Slovakia",
+    .default = x)
+}
+
+# Country ISO3 codes are more reliable than names for retrieving WDI data.
+# This mapping covers the 54 African countries in 'african_countries'.
+africa_iso <- tibble::tribble(
+  ~Country, ~iso3c,
+  "Algeria","DZA", "Angola","AGO", "Benin","BEN", "Botswana","BWA",
+  "Burkina Faso","BFA", "Burundi","BDI", "Cabo Verde","CPV",
+  "Cameroon","CMR", "Central African Republic","CAF", "Chad","TCD",
+  "Comoros","COM", "DR Congo","COD", "Republic of Congo","COG",
+  "Cote d'Ivoire","CIV", "Djibouti","DJI", "Egypt","EGY",
+  "Equatorial Guinea","GNQ", "Eritrea","ERI", "Eswatini","SWZ",
+  "Ethiopia","ETH", "Gabon","GAB", "Gambia","GMB", "Ghana","GHA",
+  "Guinea","GIN", "Guinea-Bissau","GNB", "Kenya","KEN",
+  "Lesotho","LSO", "Liberia","LBR", "Libya","LBY",
+  "Madagascar","MDG", "Malawi","MWI", "Mali","MLI",
+  "Mauritania","MRT", "Mauritius","MUS", "Morocco","MAR",
+  "Mozambique","MOZ", "Namibia","NAM", "Niger","NER",
+  "Nigeria","NGA", "Rwanda","RWA", "Sao Tome and Principe","STP",
+  "Senegal","SEN", "Seychelles","SYC", "Sierra Leone","SLE",
+  "Somalia","SOM", "South Africa","ZAF", "South Sudan","SSD",
+  "Sudan","SDN", "Tanzania","TZA", "Togo","TGO",
+  "Tunisia","TUN", "Uganda","UGA", "Zambia","ZMB", "Zimbabwe","ZWE"
+)
+stopifnot(setequal(africa_iso$Country, african_countries))
+
+# Download all 2014-2024 macro indicators from World Bank WDI.
+# Cache locally so knitting does not require repeated API downloads.
+gdp_file <- "country_gdp_panel.csv"
+if (file.exists(gdp_file)) {
+  gdp <- readr::read_csv(gdp_file, show_col_types = FALSE)
+  message("Using cached WDI data: ", gdp_file)
+} else {
+  wdi_raw <- WDI::WDI(
+    country = africa_iso$iso3c,
+    indicator = c(
+      GDP_USD = "NY.GDP.MKTP.CD",
+      GDP_per_capita_USD = "NY.GDP.PCAP.CD",
+      Trade_open_percent_GDP = "NE.TRD.GNFS.ZS",
+      FDI_net_inflows_percent_GDP = "BX.KLT.DINV.WD.GD.ZS"
+    ),
+    start = 2014, end = 2024, extra = FALSE
+  )
+  if (is.null(wdi_raw) || !nrow(wdi_raw)) stop("World Bank WDI returned no observations; check internet access.")
+  # WDI versions may return either friendly indicator names or original codes.
+  # Standardize explicitly before dplyr::transmute() to avoid missing-column errors.
+  indicator_map <- c(
+    GDP_USD = "NY.GDP.MKTP.CD",
+    GDP_per_capita_USD = "NY.GDP.PCAP.CD",
+    Trade_open_percent_GDP = "NE.TRD.GNFS.ZS",
+    FDI_net_inflows_percent_GDP = "BX.KLT.DINV.WD.GD.ZS"
+  )
+  for (friendly in names(indicator_map)) {
+    original <- unname(indicator_map[[friendly]])
+    if (!(friendly %in% names(wdi_raw)) && original %in% names(wdi_raw)) {
+      names(wdi_raw)[names(wdi_raw) == original] <- friendly
+    }
+    if (!(friendly %in% names(wdi_raw))) {
+      warning("WDI indicator missing: ", friendly, " (", original, "). Filling NA.")
+      wdi_raw[[friendly]] <- NA_real_
+    }
+  }
+  if (all(is.na(wdi_raw$GDP_USD))) {
+    stop("World Bank did not return GDP values. Available columns: ",
+         paste(names(wdi_raw), collapse = ", "))
+  }
+  if (!("iso3c" %in% names(wdi_raw))) {
+    stop("WDI did not return iso3c country codes. Columns: ",
+         paste(names(wdi_raw), collapse = ", "))
+  }
+  gdp <- wdi_raw %>%
+    transmute(
+      iso3c = as.character(iso3c),
+      Year = as.integer(year),
+      GDP_USD = as.numeric(GDP_USD),
+      GDP_per_capita_USD = as.numeric(GDP_per_capita_USD),
+      Trade_open_percent_GDP = as.numeric(Trade_open_percent_GDP),
+      FDI_net_inflows_percent_GDP = as.numeric(FDI_net_inflows_percent_GDP)
+    ) %>%
+    left_join(africa_iso, by = "iso3c") %>%
+    select(Country, Year, GDP_USD, GDP_per_capita_USD,
+           Trade_open_percent_GDP, FDI_net_inflows_percent_GDP)
+  readr::write_csv(gdp, gdp_file)
+  message("Saved World Bank WDI data: ", gdp_file)
+}
+
+required_cols <- c("Country", "Year", "GDP_USD")
+if (!all(required_cols %in% names(gdp))) stop("GDP file lacks Country, Year, or GDP_USD")
+gdp <- gdp %>%
+  mutate(Country = normalize_wdi_country(Country),
+         Year = as.integer(Year), GDP_USD = as.numeric(GDP_USD)) %>%
+  filter(Country %in% african_countries, Year %in% 2014:2024)
+if (anyDuplicated(gdp[c("Country", "Year")])) {
+  stop("Duplicate Country-Year keys in GDP file. Check the source before joining.")
+}
+
+# Check missing country-year matches explicitly.
+missing_matches <- annual_nodes %>%
+  distinct(Country, Year) %>%
+  anti_join(gdp %>% distinct(Country, Year), by = c("Country", "Year"))
+cat("Unmatched country-year pairs:", nrow(missing_matches), "\n")
+if (nrow(missing_matches)) print(missing_matches, n = min(30, nrow(missing_matches)))
+
+# Build full panel: retains all African countries in annual_nodes.
+macro_panel <- annual_nodes %>%
+  left_join(gdp, by = c("Country", "Year")) %>%
+  mutate(
+    Bilateral_debt_to_GDP_percent = if_else(
+      is.finite(GDP_USD) & GDP_USD > 0,
+      100 * IN_strength / GDP_USD, NA_real_
+    ),
+    log_GDP = if_else(is.finite(GDP_USD) & GDP_USD > 0, log(GDP_USD), NA_real_),
+    log_debt = if_else(IN_strength > 0, log(IN_strength), NA_real_),
+    log_degree = log1p(IN),
+    year_factor = factor(Year)
+  )
+
+# 2024 debt/GDP ranking (bilateral PPG debt only, not total public debt).
+debt_gdp_2024 <- macro_panel %>%
+  filter(Year == 2024, is.finite(Bilateral_debt_to_GDP_percent)) %>%
+  arrange(desc(Bilateral_debt_to_GDP_percent)) %>%
+  select(Country, IN, IN_strength, GDP_USD, Bilateral_debt_to_GDP_percent)
+knitr::kable(
+  head(debt_gdp_2024 %>% mutate(
+    Bilateral_Debt_USD_Bn = IN_strength / 1e9,
+    GDP_USD_Bn = GDP_USD / 1e9
+  ) %>% select(Country, IN, Bilateral_Debt_USD_Bn, GDP_USD_Bn,
+             Bilateral_debt_to_GDP_percent), 20),
+  digits = 2,
+  caption = "2024: bilateral PPG debt relative to GDP (percent), top 20"
+)
+
+# Extended descriptive regression: GDP and debt stock predicting connectivity.
+reg_gdp <- macro_panel %>%
+  filter(is.finite(log_GDP), is.finite(log_debt))
+if (nrow(reg_gdp) >= 30 && n_distinct(reg_gdp$Country) >= 8) {
+  model_gdp <- lm(log_degree ~ log_debt + log_GDP + year_factor, data = reg_gdp)
+  knitr::kable(
+    as.data.frame(summary(model_gdp)$coefficients) %>%
+      tibble::rownames_to_column("Term"),
+    digits = 4,
+    caption = "Descriptive OLS: creditor connectivity, bilateral debt and GDP with year effects"
+  )
+  # Optional additional controls; same sample restriction is applied to each model.
+  control_cols <- intersect(c("Trade_open_percent_GDP",
+                              "FDI_net_inflows_percent_GDP"), names(reg_gdp))
+  if (length(control_cols) == 2) {
+    reg_controls <- reg_gdp %>%
+      mutate(across(all_of(control_cols), as.numeric)) %>%
+      filter(if_all(all_of(control_cols), is.finite))
+    if (nrow(reg_controls) >= 30 && n_distinct(reg_controls$Country) >= 8) {
+      model_gdp_controls <- lm(
+        log_degree ~ log_debt + log_GDP + Trade_open_percent_GDP +
+          FDI_net_inflows_percent_GDP + year_factor,
+        data = reg_controls
+      )
+      knitr::kable(
+        as.data.frame(summary(model_gdp_controls)$coefficients) %>%
+          tibble::rownames_to_column("Term"),
+        digits = 4,
+        caption = "Descriptive OLS with trade openness and FDI controls"
+      )
+    }
+  }
+} else {
+  cat("Insufficient matched observations for GDP regression.\n")
+}
+
+# GDP-vs-connectivity plot embedded directly in knitted HTML.
+macro_panel %>%
+  filter(Year == 2024, is.finite(GDP_USD), GDP_USD > 0) %>%
+  ggplot(aes(x = GDP_USD / 1e9, y = IN)) +
+  geom_point(color = "#2563A6", size = 2.5, alpha = 0.8) +
+  scale_x_log10() +
+  labs(title = "Economic Size and Bilateral Creditor Connectivity (2024)",
+       x = "GDP (current USD billion, log scale)",
+       y = "Number of bilateral creditors") +
+  theme_minimal(base_size = 12)
+```
+
+
+# Betweenness and brokerage
+
+Betweenness centrality identifies nodes positioned along shortest paths. The analysis compares the full directed creditor-to-debtor network with the intra-African subnetwork. Shortest paths are calculated without financial weights: a larger debt amount is an exposure, not a longer distance. Because bilateral debt networks are often creditor–debtor oriented, even large creditors may have zero directed betweenness; positive values should not automatically be interpreted as financial intermediation.
+
+```{r betweenness}
+betweenness_year <- function(y,intra=FALSE) {
+ e <- edges %>% filter(Year==y)
+ if(intra) e <- e %>% filter(from %in% african_countries,to %in% african_countries)
+ if(nrow(e)==0) return(tibble(Year=integer(),Country=character(),Betweenness=numeric(),Network=character()))
+ g <- graph_from_data_frame(e %>% select(from,to,weight),directed=TRUE)
+ tibble(Year=y,Country=V(g)$name,
+        Betweenness=as.numeric(betweenness(g,directed=TRUE,weights=NA)),
+        Network=if(intra) "Intra-African" else "Global–Africa")
+}
+betw <- bind_rows(purrr::map_dfr(c(2014,2019,2024),betweenness_year,intra=FALSE),
+                  purrr::map_dfr(c(2014,2019,2024),betweenness_year,intra=TRUE))
+knitr::kable(betw %>% group_by(Network,Year) %>%
+ slice_max(Betweenness,n=10,with_ties=FALSE) %>% ungroup(),digits=2,
+ caption="Directed betweenness: benchmark-year global and intra-African networks")
+```
+
+# Network Robustness Analysis (2024)
+
+This section tests the structural importance of individual creditors in the observed 2024 bilateral debt network. Removing a creditor means deleting its creditor-to-debtor links for analytical purposes only; it does not mean cancelling outstanding debt, predicting a withdrawal of funding, or simulating default contagion. We compare network reach, the share of each debtor's outstanding bilateral debt associated with a creditor, and the concentration of remaining creditor relationships.
+
+```{r network-robustness, fig.width=10, fig.height=6}
+robust_edges <- edges %>%
+  filter(Year == 2024, is.finite(weight), weight > 0,
+         to %in% african_countries) %>%
+  group_by(from, to) %>%
+  summarise(weight = sum(weight), .groups = "drop")
+if (nrow(robust_edges) == 0) stop("No valid bilateral debt edges for 2024.")
+
+# Baseline exposure and creditor diversification by African debtor
+robust_baseline <- robust_edges %>%
+  group_by(to) %>%
+  summarise(total_debt = sum(weight), n_creditors = n_distinct(from),
+            baseline_hhi = sum((weight / sum(weight))^2), .groups = "drop")
+
+# Each row is one creditor-debtor relationship. Its share is the
+# fraction of that debtor's observed bilateral PPG debt owed to that creditor.
+robust_links <- robust_edges %>%
+  left_join(robust_baseline, by = "to") %>%
+  mutate(debtor_exposure_share = 100 * weight / total_debt)
+
+# One-at-a-time creditor removal: direct structural effects.
+robustness_results <- robust_links %>%
+  group_by(Creditor = from) %>%
+  summarise(
+    Affected_debtors = n_distinct(to),
+    Links_removed = n(),
+    Exposure_USD_Bn = sum(weight) / 1e9,
+    Max_debtor_exposure_percent = max(debtor_exposure_share),
+    Mean_debtor_exposure_percent = mean(debtor_exposure_share),
+    Sole_creditor_debtors = sum(n_creditors == 1),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(Affected_debtors), desc(Exposure_USD_Bn))
+
+knitr::kable(
+  head(robustness_results, 15), digits = 2,
+  caption = "2024 creditor-removal stress test: observed connectivity and exposure"
+)
+
+# Show reach (number of debtor links) only; avoid an empty isolation plot.
+top_reach <- robustness_results %>%
+  slice_max(Affected_debtors, n = 12, with_ties = FALSE)
+print(
+  ggplot(top_reach, aes(x = reorder(Creditor, Affected_debtors),
+                        y = Affected_debtors)) +
+    geom_col(fill = "#2878A9", width = 0.72) +
+    geom_text(aes(label = Affected_debtors), hjust = -0.15, size = 3.4) +
+    coord_flip(clip = "off") +
+    scale_y_continuous(expand = expansion(mult = c(0, 0.13))) +
+    labs(title = "Which creditors reach the most African debtors?",
+         subtitle = "2024: links lost under one-at-a-time creditor removal",
+         x = NULL, y = "African debtor countries affected") +
+    theme_minimal(base_size = 12) +
+    theme(panel.grid.major.y = element_blank())
+)
+```
+
+Dependence on individual creditors
+
+The number of links alone can hide large financial dependence. The next figure identifies the largest single-creditor share of each debtor's observed bilateral PPG debt stock. A country with multiple creditor links can still be highly concentrated.
+
+```{r robustness-dependence, fig.width=10, fig.height=7}
+debtor_dependence <- robust_links %>%
+  group_by(to) %>%
+  slice_max(debtor_exposure_share, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  transmute(Country = to, Main_creditor = from,
+            Main_creditor_share_percent = debtor_exposure_share,
+            Number_creditors = n_creditors,
+            Bilateral_debt_USD_Bn = total_debt / 1e9) %>%
+  arrange(desc(Main_creditor_share_percent))
+
+knitr::kable(
+  head(debtor_dependence, 20), digits = 2,
+  caption = "2024: African countries most dependent on one bilateral creditor"
+)
+
+# Restrict the display to meaningful debt stocks to avoid a chart
+# dominated by tiny observations. All countries remain in the table above.
+plot_dependence <- debtor_dependence %>%
+  filter(Bilateral_debt_USD_Bn >= 0.1) %>%
+  slice_max(Main_creditor_share_percent, n = 15, with_ties = FALSE)
+if (nrow(plot_dependence) == 0) {
+  plot_dependence <- debtor_dependence %>% head(15)
+}
+
+print(
+  ggplot(plot_dependence,
+         aes(x = reorder(Country, Main_creditor_share_percent),
+             y = Main_creditor_share_percent)) +
+    geom_col(fill = "#C66A35", width = 0.72) +
+    geom_text(aes(label = paste0(round(Main_creditor_share_percent, 1), "%")),
+              hjust = -0.1, size = 3.2) +
+    coord_flip(clip = "off") +
+    scale_y_continuous(limits = c(0, 110), breaks = seq(0, 100, 20)) +
+    labs(title = "How dependent are African debtors on their largest creditor?",
+         subtitle = "2024; chart prioritizes debt stocks of at least USD 100 million",
+         x = NULL, y = "Largest creditor's share of bilateral debt (%)") +
+    theme_minimal(base_size = 12) +
+    theme(panel.grid.major.y = element_blank())
+)
+```
+
+ Robustness interpretation
+
+```{r robustness-interpretation, results='asis'}
+most_reach <- robustness_results %>% slice_max(Affected_debtors, n = 1, with_ties = FALSE)
+most_exposure <- robustness_results %>% slice_max(Exposure_USD_Bn, n = 1, with_ties = FALSE)
+most_dependent <- debtor_dependence %>% slice(1)
+
+cat("In 2024, **", most_reach$Creditor,
+    "** has the widest observed creditor reach, with links to **",
+    most_reach$Affected_debtors, "** African debtor countries. ",
+    "The largest aggregate bilateral exposure belongs to **",
+    most_exposure$Creditor, "** (USD ",
+    round(most_exposure$Exposure_USD_Bn, 2), " billion). ",
+    "Reach and financial exposure are distinct dimensions of network importance.\n\n",
+    sep = "")
+cat("At the debtor level, **", most_dependent$Country,
+    "** has the highest observed single-creditor concentration: **",
+    most_dependent$Main_creditor, "** accounts for **",
+    round(most_dependent$Main_creditor_share_percent, 1),
+    "%** of its bilateral PPG debt stock. ",
+    "A high share indicates creditor concentration, not necessarily imminent distress.\n\n",
+    sep = "")
+if (all(robustness_results$Sole_creditor_debtors == 0)) {
+  cat("No African debtor with positive observed 2024 bilateral debt has only one creditor in this dataset. ",
+      "Consequently, deleting any single creditor's links does not isolate a debtor; ",
+      "the isolation chart is omitted because all values would be zero.\n\n")
+} else {
+  cat("Some debtors have only one observed bilateral creditor. ",
+      "Removing that creditor would isolate those debtors within the observed bilateral network.\n\n")
+}
+cat("**Interpretation limit:** This is a one-step structural robustness exercise, ",
+    "not an Eisenberg–Noe clearing or contagion model. ",
+    "It measures the topology and concentration of existing debt relationships, ",
+    "not the probability of default or the economic effect of losing future credit.\n")
+```
+
+FOr  Conclusion
+
+```{r conclusion,results='asis'}
+h14 <- concentration_summary$Mean_HHI[concentration_summary$Year==2014]
+h24 <- concentration_summary$Mean_HHI[concentration_summary$Year==2024]
+cat("Between 2019 and 2024, the observed bilateral debt stock ",
+    ifelse(change_19_24>=0,"increased","decreased")," by ",fmtpct(abs(change_19_24)),
+    " relative to 2019. This describes changes in outstanding bilateral debt, not annual new commitments.\n\n",sep="")
+if(length(h14)==1 && length(h24)==1) {
+ cat("Average debtor-level creditor concentration changed from **",fmt(h14,3)," in 2014** to **",fmt(h24,3)," in 2024**. ",sep="")
+ cat(if(h24>h14) "The observed bilateral creditor portfolios became more concentrated on average. " else if(h24<h14) "The observed bilateral creditor portfolios became more diversified on average. " else "Average concentration was unchanged. ")
+}
+regional14 <- integration_annual %>% filter(Year==2014,Creditor_origin=="African creditors") %>% pull(Share)
+regional24 <- integration_annual %>% filter(Year==2024,Creditor_origin=="African creditors") %>% pull(Share)
+if(length(regional14)==1 && length(regional24)==1) {
+ cat("The share of observed bilateral debt owed to African creditors changed from **",
+     fmtpct(regional14)," in 2014** to **",fmtpct(regional24)," in 2024**. ",sep="")
+ cat(if(regional24>regional14) "This indicates a larger regional share of bilateral creditor exposure. " else if(regional24<regional14) "This indicates a smaller regional share of bilateral creditor exposure. " else "The regional share was unchanged. ")
+ cat("The measure does not capture portfolio investment, bank lending or other channels of financial integration.\n\n")
+}
+mod14 <- modularity_years %>% filter(Year==2014,Network=="Global–Africa") %>% pull(Modularity)
+mod24 <- modularity_years %>% filter(Year==2024,Network=="Global–Africa") %>% pull(Modularity)
+if(length(mod14)==1 && length(mod24)==1) {
+ cat("Weighted global-network Louvain modularity changed from **",fmt(mod14,3),"** to **",fmt(mod24,3),"**. ",sep="")
+ cat("This documents changes in detected community structure, but it is not evidence by itself of geopolitical polarization.\n\n")
+}
+if(nrow(creditor_total)) cat("The largest observed creditor by mean annual outstanding exposure was **",creditor_total$from[1],"** (",fmt(creditor_total$Mean_exposure_USD_Bn[1],2)," USD billion). ",sep="")
+cat("These rankings should be interpreted alongside the number of debtor relationships: network reach and financial exposure measure different dimensions of creditor importance.\n\n")
+if(!is.null(model)) {
+ b <- coef(model)["log_debt"]
+ cat("The country–year regression finds a ",ifelse(b>=0,"positive","negative")," association between bilateral debt stock and creditor connectivity (coefficient ",fmt(b,3),"). ",sep="")
+ cat("This does not demonstrate that borrowing itself causes centrality: economic size, creditworthiness, access to international finance and creditor strategy may jointly shape both.\n\n")
+}
+cat("Overall, the network approach reveals creditor financial exposure, regional versus external bilateral-debt integration, creditor concentration, community structure and how these patterns evolved around the pandemic. The dataset covers observed bilateral PPG external debt, not all external debt, total government liabilities or repayment capacity. Changes in nominal USD stocks may also reflect exchange rates, valuation and restructuring. Creditor concentration can indicate dependence, but it is not by itself evidence of default risk or systemic contagion.\n")
+```
+
