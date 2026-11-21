@@ -4,7 +4,7 @@
 
 **Overview**
 
-This project examines the structure and evolution of bilateral public and publicly guaranteed (PPG) external debt relationships between African countries and their creditors from 2014 to 2024. Inspired by Bhattacharya, Inekwe and Valenzuela (2018), it applies network analysis to a different financial instrument—outstanding bilateral sovereign debt—to explore connectivity, creditor concentration, and structural dependence.
+This project examines the structure and evolution of bilateral public and publicly guaranteed (PPG) external debt relationships between African countries and their creditors from 2014 to 2024. Inspired by Bhattacharya, Inekwe and Valenzuela (2018), it applies network analysis to a different financial instrument outstanding bilateral sovereign debt to explore connectivity, creditor concentration, and structural dependence.
 
 The analysis models creditors and African borrowers as nodes in a **directed, weighted network**. A link runs from a creditor to a debtor, with its weight representing the outstanding bilateral debt stock.
 
@@ -12,7 +12,7 @@ The analysis models creditors and African borrowers as nodes in a **directed, we
 
 The main data source is the **World Bank International Debt Statistics** (indicator `DT.DOD.BLAT.CD`), complemented by World Bank macroeconomic indicators and the **Boston University Chinese Loans to Africa** database. The observed dataset includes **50 African debtor countries**, **38 creditors**, and **4,897 positive creditor–debtor–year links**.
 
-Methods include degree and strength centrality, the Herfindahl–Hirschman Index (HHI) for creditor concentration, weighted Louvain community detection, Ward hierarchical clustering of creditor-share profiles, pooled country–year OLS regressions, and hypothetical creditor-removal exercises.
+Methods include degree and strength centrality, the Herfindahl–Hirschman Index (HHI) for creditor concentration, weighted Louvain community detection, Ward hierarchical clustering of creditor-share profiles, pooled country/year OLS regressions, and hypothetical creditor-removal exercises.
 
 **Selected finding**
 
